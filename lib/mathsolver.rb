@@ -218,21 +218,21 @@ module MathSolver
       call = -> { transport.call(url, { model: model, messages: messages, temperature: 0 }, api_key) }
 
       begin
-        parsed = parse_solver_json(call.call)
+        parsed = MathSolver.parse_solver_json(call.call)
       rescue Error => e
         raise unless e.code == 'INVALID_JSON'
         messages << { role: 'assistant', content: 'invalid JSON' }
         messages << { role: 'user', content: 'Your reply was not valid JSON. Reply again with the exact strict JSON shape.' }
-        parsed = parse_solver_json(call.call)
+        parsed = MathSolver.parse_solver_json(call.call)
       end
 
       evaluate = lambda do |p|
         ev = begin
-          eval_expression(p[:expression])
+          MathSolver.eval_expression(p[:expression])
         rescue Error
           nil
         end
-        [ev, ev && numerically_equal(ev, p[:answer])]
+        [ev, ev && MathSolver.numerically_equal(ev, p[:answer])]
       end
 
       evaluated, verified = evaluate.call(parsed)
@@ -242,7 +242,7 @@ module MathSolver
         messages << { role: 'assistant', content: JSON.generate(parsed) }
         messages << { role: 'user', content: "Your verification expression evaluated to #{evaluated || 'an error'}, which does not match your answer #{parsed[:answer]}. Re-derive the problem carefully and reply again with the same strict JSON shape." }
         begin
-          second = parse_solver_json(call.call)
+          second = MathSolver.parse_solver_json(call.call)
           ev2, ok2 = evaluate.call(second)
           evaluated = ev2 unless ev2.nil?
           parsed = second if ok2
