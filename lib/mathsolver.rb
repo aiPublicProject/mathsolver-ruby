@@ -181,52 +181,78 @@ module MathSolver
 
   Result = Struct.new(:answer, :steps, :expression, :evaluated, :verified, :retries, keyword_init: true)
 
-  # transport: callable(url, body_hash, api_key) -> model reply string
-  def self.solve(problem, api_key: '', base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini', transport: DEFAULT_TRANSPORT)
-    raise Error.new('NO_API_KEY', 'api_key is required (BYOK)') if api_key.to_s.empty?
-    raise Error.new('NO_PROBLEM', 'problem must be non-empty') if problem.to_s.strip.empty?
-    url = "#{base_url.to_s.sub(%r{/+\z}, '')}/chat/completions"
-    messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: problem }
-    ]
-    call = -> { transport.call(url, { model: model, messages: messages, temperature: 0 }, api_key) }
-
-    begin
-      parsed = parse_solver_json(call.call)
-    rescue Error => e
-      raise unless e.code == 'INVALID_JSON'
-      messages << { role: 'assistant', content: 'invalid JSON' }
-      messages << { role: 'user', content: 'Your reply was not valid JSON. Reply again with the exact strict JSON shape.' }
-      parsed = parse_solver_json(call.call)
-    end
-
-    evaluate = lambda do |p|
-      ev = begin
-        eval_expression(p[:expression])
-      rescue Error
-        nil
+  # BYOK client for an OpenAI-compatible endpoint. Instantiate once, solve many.
+  #
+  #   solver = MathSolver::Client.new(api_key: 'sk-...', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat')
+  #   result = solver.solve('2x + 3 = 11, solve for x')
+  class Client
+    def initialize(api_key:, base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini', transport: MathSolver::DEFAULT_TRANSPORT)
+      raise MathSolver::Error.new('NO_API_KEY', 'api_key is required (BYOK)') if api_key.to_s.empty?
+      @base = base_url.to_s.sub(%r{/+\z}, '')
+      unless @base.start_with?('http://', 'https://')
+        raise MathSolver::Error.new('BAD_BASE_URL', 'base_url must be an http(s) URL, e.g. https://api.deepseek.com/v1')
       end
-      [ev, ev && numerically_equal(ev, p[:answer])]
+      @api_key = api_key
+      @base_url = base_url
+      @model = model
+      @transport = transport
     end
 
-    evaluated, verified = evaluate.call(parsed)
-    retries = 0
-    unless verified
-      retries = 1
-      messages << { role: 'assistant', content: JSON.generate(parsed) }
-      messages << { role: 'user', content: "Your verification expression evaluated to #{evaluated || 'an error'}, which does not match your answer #{parsed[:answer]}. Re-derive the problem carefully and reply again with the same strict JSON shape." }
+    attr_reader :model
+
+    def model=(m)
+      @model = m
+    end
+
+      def solve(problem)
+        api_key = @api_key
+        model = @model
+        transport = @transport
+        base_url = @base
+        raise MathSolver::Error.new('NO_PROBLEM', 'problem must be non-empty') if problem.to_s.strip.empty?
+        url = "#{base_url.to_s.sub(%r{/+\z}, '')}/chat/completions"
+      messages = [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: problem }
+      ]
+      call = -> { transport.call(url, { model: model, messages: messages, temperature: 0 }, api_key) }
+
       begin
-        second = parse_solver_json(call.call)
-        ev2, ok2 = evaluate.call(second)
-        evaluated = ev2 unless ev2.nil?
-        parsed = second if ok2
-        verified = true if ok2
-      rescue Error
+        parsed = parse_solver_json(call.call)
+      rescue Error => e
+        raise unless e.code == 'INVALID_JSON'
+        messages << { role: 'assistant', content: 'invalid JSON' }
+        messages << { role: 'user', content: 'Your reply was not valid JSON. Reply again with the exact strict JSON shape.' }
+        parsed = parse_solver_json(call.call)
       end
-    end
 
-    Result.new(answer: parsed[:answer], steps: parsed[:steps], expression: parsed[:expression],
-               evaluated: evaluated, verified: !!verified, retries: retries)
+      evaluate = lambda do |p|
+        ev = begin
+          eval_expression(p[:expression])
+        rescue Error
+          nil
+        end
+        [ev, ev && numerically_equal(ev, p[:answer])]
+      end
+
+      evaluated, verified = evaluate.call(parsed)
+      retries = 0
+      unless verified
+        retries = 1
+        messages << { role: 'assistant', content: JSON.generate(parsed) }
+        messages << { role: 'user', content: "Your verification expression evaluated to #{evaluated || 'an error'}, which does not match your answer #{parsed[:answer]}. Re-derive the problem carefully and reply again with the same strict JSON shape." }
+        begin
+          second = parse_solver_json(call.call)
+          ev2, ok2 = evaluate.call(second)
+          evaluated = ev2 unless ev2.nil?
+          parsed = second if ok2
+          verified = true if ok2
+        rescue Error
+        end
+      end
+
+      Result.new(answer: parsed[:answer], steps: parsed[:steps], expression: parsed[:expression],
+                 evaluated: evaluated, verified: !!verified, retries: retries)
+    end
   end
 end

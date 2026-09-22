@@ -28,7 +28,14 @@ class TestEval < Minitest::Test
   end
 end
 
-class TestSolve < Minitest::Test
+class TestClient < Minitest::Test
+  def test_constructor_validation
+    e = assert_raises(MathSolver::Error) { MathSolver::Client.new(api_key: '') }
+    assert_equal 'NO_API_KEY', e.code
+    e = assert_raises(MathSolver::Error) { MathSolver::Client.new(api_key: 'sk', base_url: 'not-a-url') }
+    assert_equal 'BAD_BASE_URL', e.code
+  end
+
   def test_verified_first_try
     calls = []
     seen = nil
@@ -37,7 +44,8 @@ class TestSolve < Minitest::Test
       seen = [url, body, key]
       GOOD
     end
-    r = MathSolver.solve('2x + 3 = 11, solve for x', api_key: 'sk-test', transport: transport)
+    solver = MathSolver::Client.new(api_key: 'sk-test', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', transport: transport)
+    r = solver.solve('2x + 3 = 11, solve for x')
     assert r.verified
     assert_equal 4, r.answer
     assert_equal 4, r.evaluated
@@ -53,7 +61,7 @@ class TestSolve < Minitest::Test
       n += 1
       n == 1 ? WRONG : GOOD
     end
-    r = MathSolver.solve('2x+3=11', api_key: 'sk', transport: transport)
+    r = MathSolver::Client.new(api_key: 'sk', transport: transport).solve('2x+3=11')
     assert r.verified
     assert_equal 1, r.retries
   end
@@ -61,18 +69,18 @@ class TestSolve < Minitest::Test
   def test_invalid_json_then_ok
     n = 0
     transport = ->(_u, _b, _k) { n += 1; n == 1 ? 'no json' : GOOD }
-    r = MathSolver.solve('1+1', api_key: 'sk', transport: transport)
+    r = MathSolver::Client.new(api_key: 'sk', transport: transport).solve('1+1')
     assert r.verified
   end
 
   def test_invalid_twice_raises
     transport = ->(_u, _b, _k) { 'nothing' }
-    err = assert_raises(MathSolver::Error) { MathSolver.solve('1+1', api_key: 'sk', transport: transport) }
+    err = assert_raises(MathSolver::Error) { MathSolver::Client.new(api_key: 'sk', transport: transport).solve('1+1') }
     assert_equal 'INVALID_JSON', err.code
   end
 
   def test_no_api_key
-    err = assert_raises(MathSolver::Error) { MathSolver.solve('1+1') }
+    err = assert_raises(MathSolver::Error) { MathSolver::Client.new(api_key: '') }
     assert_equal 'NO_API_KEY', err.code
   end
 
@@ -82,14 +90,14 @@ class TestSolve < Minitest::Test
       calls += 1
       raise MathSolver::Error.new('HTTP_ERROR', '401')
     end
-    err = assert_raises(MathSolver::Error) { MathSolver.solve('1+1', api_key: 'sk', transport: transport) }
+    err = assert_raises(MathSolver::Error) { MathSolver::Client.new(api_key: 'sk', transport: transport).solve('1+1') }
     assert_equal 'HTTP_ERROR', err.code
     assert_equal 1, calls
   end
 
   def test_still_wrong_unverified
     transport = ->(_u, _b, _k) { WRONG }
-    r = MathSolver.solve('2x+3=11', api_key: 'sk', transport: transport)
+    r = MathSolver::Client.new(api_key: 'sk', transport: transport).solve('2x+3=11')
     refute r.verified
     assert_equal 1, r.retries
   end
