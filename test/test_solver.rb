@@ -1,3 +1,4 @@
+require 'json'
 require 'minitest/autorun'
 require_relative '../lib/mathsolver'
 
