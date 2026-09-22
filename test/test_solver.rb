@@ -103,3 +103,16 @@ class TestClient < Minitest::Test
     assert_equal 1, r.retries
   end
 end
+
+
+class TestSmoke < Minitest::Test
+  def test_real_api
+    key = ENV['SMOKE_API_KEY']
+    skip 'smoke: set SMOKE_API_KEY to run' unless key
+    base = ENV['SMOKE_BASE_URL'] || 'https://api.openai.com/v1'
+    r = MathSolver::Client.new(api_key: key, base_url: base).solve('2x + 3 = 11, solve for x')
+    puts "smoke: answer=#{r.answer} verified=#{r.verified} retries=#{r.retries}"
+    assert r.verified
+    assert_in_delta 4, r.answer
+  end
+end
