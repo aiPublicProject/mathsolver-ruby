@@ -237,8 +237,11 @@ class TestSmoke < Minitest::Test
   def test_real_api
     key = ENV['SMOKE_API_KEY']
     skip 'smoke: set SMOKE_API_KEY to run' unless key && !key.empty?
-    base = ENV['SMOKE_BASE_URL'] || 'https://api.openai.com/v1'
-    r = MathSolver::Client.new(api_key: key, base_url: base).solve('2x + 3 = 11, solve for x')
+    base = ENV['SMOKE_BASE_URL']
+    base = 'https://api.openai.com/v1' if base.nil? || base.empty?
+    model = ENV['SMOKE_MODEL']
+    model = 'gpt-4o-mini' if model.nil? || model.empty?
+    r = MathSolver::Client.new(api_key: key, base_url: base, model: model).solve('2x + 3 = 11, solve for x')
     puts "smoke: answer=#{r.answer} verified=#{r.verified} retries=#{r.retries}"
     assert r.verified
     assert_in_delta 4, r.answer
