@@ -1,6 +1,12 @@
-# mathsolver-ruby — BYOK AI math solver with independent verification.
-# An answer is only verified=true when the model's verification expression
-# (pure arithmetic) is evaluated locally and matches the answer.
+# mathsolver-ruby — BYOK AI math solver with execution-based verification (v0.2).
+#
+# Correctness model (PAL-style): the model never states the answer.
+# It returns a small JavaScript-like PROGRAM; this gem executes the program
+# deterministically and the execution output IS the answer.
+# For equations, a CHECK expression ({x} placeholder) must evaluate to 0
+# when the computed answer is substituted back into the original equation.
+
+require 'json'
 
 module MathSolver
   class Error < StandardError
@@ -14,16 +20,31 @@ module MathSolver
   SYSTEM_PROMPT = <<~PROMPT
     You are a precise math solver.
     Reply with STRICT JSON only, no markdown fences, in this exact shape:
-    {"answer": <number>, "steps": [<string>, ...], "verification": {"expression": "<string>"}}
+    {"program": "<string>", "steps": [<string>, ...], "check": "<string>"}
     Rules:
-    - "answer" must be a single number (the final result).
-    - "steps" must be an array of short plain-language explanation strings.
-    - "verification.expression" must be a pure arithmetic expression that
-      evaluates to the answer. Allowed: numbers, + - * / % ^ ( ), and the
-      functions abs sqrt sin cos tan ln log exp floor ceil round min max
-      (log is base 10, ln is natural), and the constants pi and e.
-    - The expression must recompute the answer independently.
+    - "program" is a small JavaScript-like program that computes the final answer.
+      One statement per line (or ; separated). Allowed statements:
+          let NAME = EXPRESSION
+          result = EXPRESSION
+      EXPRESSIONs may use numbers, + - * / % ^ ( ), the functions
+      abs sqrt sin cos tan ln log exp floor ceil round min max
+      (log is base 10, ln is natural), the constants pi and e, and any
+      variable defined by an earlier let. The value assigned to "result"
+      is the answer. Never state the answer as a number in text.
+    - "steps" is an array of short plain-language explanation strings.
+    - "check" is a verification expression containing the placeholder {x}.
+      After solving, {x} is replaced by the computed answer and the whole
+      expression must evaluate to 0.
+      For equations, substitute the answer back into the original equation
+      (e.g. 2x+3=11 -> "2*{x}+3-11").
+      For arithmetic, recompute via a different path and subtract the answer
+      (e.g. 15% of 80 -> "80*15/100-{x}"). Provide "check" whenever possible.
   PROMPT
+
+  def self.correction_prompt(reason)
+    "Your submission failed verification: #{reason}. " \
+      'Re-derive the problem carefully and reply again with the same strict JSON shape.'
+  end
 
   MODULE_FUNCS = {
     'abs' => ->(x) { x.abs }, 'sqrt' => ->(x) { Math.sqrt(x) },
@@ -35,6 +56,9 @@ module MathSolver
   CONSTANTS = { 'pi' => Math::PI, 'e' => Math::E }.freeze
 
   TOKEN_RE = /\s*(?:(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\.\d+)|([a-zA-Z_][a-zA-Z_0-9]*)|([-+*\/%^(),]))/
+  LET_RE = /\Alet\s+([a-zA-Z_]\w*)\s*=\s*(.+)\z/
+  ASSIGN_RE = /\A([a-zA-Z_]\w*)\s*=\s*(.+)\z/
+  CHECK_X_RE = /\{\s*x\s*\}/i
 
   def self.tokenize(src)
     tokens = []
@@ -52,11 +76,11 @@ module MathSolver
   end
 
   # Evaluate a pure arithmetic expression string. No eval() is used.
-  def self.eval_expression(src)
+  # env maps variable names (case-sensitive, shadow pi/e) to values.
+  def self.eval_expression(src, env = {})
     raise Error.new('EXPR_EMPTY', 'empty expression') if src.nil? || src.strip.empty?
     tokens = tokenize(src)
     box = [0]
-    # simple recursive functions using box for position
     peek = -> { tokens[box[0]] }
     eat = -> {
       t = tokens[box[0]]
@@ -73,20 +97,24 @@ module MathSolver
       case t[0]
       when :num then t[1]
       when :id
-        name = t[1].downcase
-        if peek.call && peek.call[0] == '('
-          eat.call
-          args = [parse_expr.call]
-          while peek.call && peek.call[0] == ','
+        if env.key?(t[1])
+          env[t[1]]
+        else
+          name = t[1].downcase
+          if peek.call && peek.call[0] == '('
             eat.call
-            args << parse_expr.call
+            args = [parse_expr.call]
+            while peek.call && peek.call[0] == ','
+              eat.call
+              args << parse_expr.call
+            end
+            raise Error.new('EXPR_SYNTAX', 'expected )') unless eat.call[0] == ')'
+            fn = MODULE_FUNCS[name]
+            raise Error.new('EXPR_UNKNOWN_FUNC', "unknown function #{name}") unless fn
+            fn.call(*args).to_f
+          elsif CONSTANTS.key?(name) then CONSTANTS[name]
+          else raise Error.new('EXPR_UNKNOWN_ID', "unknown identifier #{name}")
           end
-          raise Error.new('EXPR_SYNTAX', 'expected )') unless eat.call[0] == ')'
-          fn = MODULE_FUNCS[name]
-          raise Error.new('EXPR_UNKNOWN_FUNC', "unknown function #{name}") unless fn
-          fn.call(*args).to_f
-        elsif CONSTANTS.key?(name) then CONSTANTS[name]
-        else raise Error.new('EXPR_UNKNOWN_ID', "unknown identifier #{name}")
         end
       when '('
         v = parse_expr.call
@@ -139,8 +167,42 @@ module MathSolver
     value
   end
 
-  def self.numerically_equal(a, b)
-    (a - b).abs <= 1e-6 * [1.0, a.abs, b.abs].max
+  # Execute a model-generated program. Statements (one per line or ;
+  # separated): let NAME = EXPR | NAME = EXPR | bare EXPR. The answer is
+  # the value of `result`, else the last bare expression. The model never
+  # states the answer as a number — execution output IS the answer.
+  def self.run_program(src)
+    raise Error.new('PROGRAM_EMPTY', 'empty program') if src.nil? || src.strip.empty?
+    env = {}
+    result_defined = false
+    last_defined = false
+    last_value = nil
+    src.split(/[\n;]+/).each do |raw|
+      line = raw.strip
+      next if line.empty?
+      if (m = LET_RE.match(line))
+        env[m[1]] = eval_expression(m[2], env)
+        result_defined = true if m[1] == 'result'
+      elsif (m2 = ASSIGN_RE.match(line))
+        env[m2[1]] = eval_expression(m2[2], env)
+        result_defined = true if m2[1] == 'result'
+      else
+        last_value = eval_expression(line, env)
+        last_defined = true
+      end
+    end
+    return env['result'] if result_defined
+    return last_value if last_defined
+    raise Error.new('PROGRAM_NO_RESULT', 'program produced no result')
+  end
+
+  # Substitute the computed answer into a check expression ({x} placeholder)
+  # and evaluate it. Returns { value:, passed: }; passed when ~0 (scaled
+  # tolerance). Block-form gsub keeps the replacement literal.
+  def self.run_check(check_src, answer)
+    substituted = check_src.gsub(CHECK_X_RE) { "(#{answer})" }
+    value = eval_expression(substituted)
+    { value: value, passed: value.abs <= 1e-6 * [1.0, answer.abs].max }
   end
 
   def self.parse_solver_json(text)
@@ -152,41 +214,57 @@ module MathSolver
     rescue JSON::ParserError
       raise Error.new('INVALID_JSON', 'reply was not valid JSON')
     end
-    answer = data['answer']
-    if answer.is_a?(String)
-      mm = answer.match(/-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/)
-      answer = mm ? mm[0].to_f : nil
+    program = data['program']
+    unless program.is_a?(String) && !program.strip.empty?
+      raise Error.new('INVALID_JSON', 'missing program')
     end
-    raise Error.new('INVALID_JSON', 'missing numeric answer') unless answer.is_a?(Numeric)
-    expression = data.dig('verification', 'expression')
-    raise Error.new('INVALID_JSON', 'missing verification.expression') unless expression.is_a?(String)
     steps = data['steps'].is_a?(Array) ? data['steps'].map(&:to_s) : []
-    { answer: answer.to_f, steps: steps, expression: expression }
+    check = data['check'].is_a?(String) && !data['check'].strip.empty? ? data['check'] : nil
+    { program: program, steps: steps, check: check }
   end
 
-  DEFAULT_TRANSPORT = lambda do |url, body, api_key|
+  # Real HTTP POST via Net::HTTP. Returns [status, raw body].
+  REAL_HTTP_POST = lambda do |url, headers, body_json|
     require 'net/http'
     require 'uri'
     uri = URI(url)
     http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = true
-    req = Net::HTTP::Post.new(uri.path, 'Content-Type' => 'application/json', 'Authorization' => "Bearer #{api_key}")
-    req.body = JSON.generate(body)
+    http.use_ssl = uri.scheme == 'https'
+    req = Net::HTTP::Post.new(uri.request_uri, headers)
+    req.body = body_json
     res = http.request(req)
-    raise Error.new('HTTP_ERROR', "API responded #{res.code}") unless res.is_a?(Net::HTTPSuccess)
-    content = JSON.parse(res.body).dig('choices', 0, 'message', 'content')
+    [res.code.to_i, res.body]
+  end
+
+  def self.content_from_response(status, raw)
+    require 'json'
+    raise Error.new('HTTP_ERROR', "API responded #{status}") if status >= 300
+    content = begin
+      JSON.parse(raw.to_s).dig('choices', 0, 'message', 'content')
+    rescue JSON::ParserError, NoMethodError, TypeError
+      nil
+    end
     raise Error.new('HTTP_ERROR', 'missing message content') unless content.is_a?(String)
     content
   end
 
-  Result = Struct.new(:answer, :steps, :expression, :evaluated, :verified, :retries, keyword_init: true)
+  DEFAULT_TRANSPORT = lambda do |url, body, api_key|
+    status, raw = MathSolver::REAL_HTTP_POST.call(
+      url,
+      { 'Content-Type' => 'application/json', 'Authorization' => "Bearer #{api_key}" },
+      JSON.generate(body)
+    )
+    MathSolver.content_from_response(status, raw)
+  end
+
+  Result = Struct.new(:answer, :steps, :program, :check, :check_value, :verified, :retries, keyword_init: true)
 
   # BYOK client for an OpenAI-compatible endpoint. Instantiate once, solve many.
   #
   #   solver = MathSolver::Client.new(api_key: 'sk-...', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat')
   #   result = solver.solve('2x + 3 = 11, solve for x')
   class Client
-    def initialize(api_key:, base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini', transport: MathSolver::DEFAULT_TRANSPORT)
+    def initialize(api_key:, base_url: 'https://api.openai.com/v1', model: 'gpt-4o-mini', transport: nil)
       raise MathSolver::Error.new('NO_API_KEY', 'api_key is required (BYOK)') if api_key.to_s.empty?
       @base = base_url.to_s.sub(%r{/+\z}, '')
       unless @base.start_with?('http://', 'https://')
@@ -196,21 +274,32 @@ module MathSolver
       @base_url = base_url
       @model = model
       @transport = transport
+      @http_post = MathSolver::REAL_HTTP_POST
     end
 
     attr_reader :model
+    # Test seam for the HTTP interface below the default transport:
+    # (url, headers, body_json) -> [status, raw body]; swap in tests, no sockets.
+    attr_accessor :http_post
 
     def model=(m)
       @model = m
     end
 
-      def solve(problem)
-        api_key = @api_key
-        model = @model
-        transport = @transport
-        base_url = @base
-        raise MathSolver::Error.new('NO_PROBLEM', 'problem must be non-empty') if problem.to_s.strip.empty?
-        url = "#{base_url.to_s.sub(%r{/+\z}, '')}/chat/completions"
+    def solve(problem)
+      api_key = @api_key
+      model = @model
+      base_url = @base
+      transport = @transport || lambda do |url, body, key|
+        status, raw = http_post.call(
+          url,
+          { 'Content-Type' => 'application/json', 'Authorization' => "Bearer #{key}" },
+          JSON.generate(body)
+        )
+        MathSolver.content_from_response(status, raw)
+      end
+      raise MathSolver::Error.new('NO_PROBLEM', 'problem must be non-empty') if problem.to_s.strip.empty?
+      url = "#{base_url}/chat/completions"
       messages = [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: problem }
@@ -226,33 +315,42 @@ module MathSolver
         parsed = MathSolver.parse_solver_json(call.call)
       end
 
-      evaluate = lambda do |p|
-        ev = begin
-          MathSolver.eval_expression(p[:expression])
-        rescue Error
-          nil
-        end
-        [ev, ev && MathSolver.numerically_equal(ev, p[:answer])]
-      end
-
-      evaluated, verified = evaluate.call(parsed)
-      retries = 0
-      unless verified
-        retries = 1
-        messages << { role: 'assistant', content: JSON.generate(parsed) }
-        messages << { role: 'user', content: "Your verification expression evaluated to #{evaluated || 'an error'}, which does not match your answer #{parsed[:answer]}. Re-derive the problem carefully and reply again with the same strict JSON shape." }
+      attempt = lambda do |p|
         begin
-          second = MathSolver.parse_solver_json(call.call)
-          ev2, ok2 = evaluate.call(second)
-          evaluated = ev2 unless ev2.nil?
-          parsed = second if ok2
-          verified = true if ok2
-        rescue Error
+          answer = MathSolver.run_program(p[:program])
+          out = { ok: true, answer: answer, check_value: nil, verified: false }
+          if p[:check]
+            r = MathSolver.run_check(p[:check], answer)
+            out[:check_value] = r[:value]
+            out[:verified] = r[:passed]
+          end
+          out
+        rescue Error => e
+          { ok: false, error: e }
         end
       end
 
-      Result.new(answer: parsed[:answer], steps: parsed[:steps], expression: parsed[:expression],
-                 evaluated: evaluated, verified: !!verified, retries: retries)
+      outcome = attempt.call(parsed)
+      retries = 0
+      unless outcome[:ok] && outcome[:verified]
+        retries = 1
+        reason = if outcome[:ok]
+                   "check evaluated to #{outcome[:check_value]} instead of 0"
+                 else
+                   "program failed to execute (#{outcome[:error].code}: #{outcome[:error].message})"
+                 end
+        messages << { role: 'assistant', content: JSON.generate({ program: parsed[:program], steps: parsed[:steps], check: parsed[:check] }) }
+        messages << { role: 'user', content: MathSolver.correction_prompt(reason) }
+        second_parsed = MathSolver.parse_solver_json(call.call) # second failure raises
+        second = attempt.call(second_parsed)
+        raise second[:error] unless second[:ok] # PROGRAM_* error persisted after retry
+        parsed = second_parsed
+        outcome = second
+      end
+
+      Result.new(answer: outcome[:answer], steps: parsed[:steps], program: parsed[:program],
+                 check: parsed[:check], check_value: outcome[:check_value],
+                 verified: !!outcome[:verified], retries: retries)
     end
   end
 end
